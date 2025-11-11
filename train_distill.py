@@ -73,7 +73,7 @@ if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 model = prepare_model_for_kbit_training(model)
 lora_config = LoraConfig(
-    r=8, lora_alpha=16,
+    r=16, lora_alpha=32,
     target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     lora_dropout=0.05, bias="none", task_type="CAUSAL_LM"
 )
@@ -145,13 +145,13 @@ def create_prompt(history_window):
 Day {args.window + 1} (predict {num_regions} regions, space separated):<|end|>
 <|assistant|>"""
 
-# 取前 16 条测试样本的历史（长度 = args.window）
-test_X = data_loader.test[0][:16]                     # (16, total_steps, num_regions)
+# 取前 64 条测试样本的历史（长度 = args.window）
+test_X = data_loader.test[0][:64]                     # (16, total_steps, num_regions)
 histories = test_X[:, :args.window].cpu().numpy()    # (16, window, num_regions)
 prompts = [create_prompt(hist) for hist in histories]
 
 # ================== 6. 自进化主循环 ==================
-BATCH_SIZE_GEN = 4
+BATCH_SIZE_GEN = 16
 MAX_NEW_TOKENS = 256
 
 def parse_nums(text, num_regions):
@@ -212,8 +212,8 @@ for gen in range(1, 6):
         rewards, _ = reward_model(X_rm_input)
     rewards = rewards.squeeze(1).cpu().numpy()
 
-    # ---------- 4. 选 Top-2 ----------
-    top_idx = np.argsort(rewards)[-2:]
+    # ---------- 4. 选 Top-8 ----------
+    top_idx = np.argsort(rewards)[-8:]
     best_r = rewards[top_idx[-1]]
     print(f"本代最佳奖励: {best_r:.4f}")
 
@@ -244,20 +244,18 @@ for gen in range(1, 6):
     trainer = SFTTrainer(
         model=model,
         train_dataset=tokenized_dataset,
-        tokenizer=tokenizer,
-        packing=False,
         args=SFTConfig(
             per_device_train_batch_size=1,
-            gradient_accumulation_steps=1,
-            num_train_epochs=1,
-            learning_rate=5e-4,
+            gradient_accumulation_steps=4,
+            num_train_epochs=3,
+            learning_rate=2e-4,
             fp16=True,
             logging_steps=1,
             output_dir=f"./evolve_gen_{gen}",
             save_strategy="no",
             gradient_checkpointing=True,
             dataloader_num_workers=0,
-            max_seq_length=256,
+            max_length=256,
             remove_unused_columns=False,
         ),
     )
