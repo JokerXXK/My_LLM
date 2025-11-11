@@ -1,4 +1,4 @@
-# train_distill.py ← 2025 终极修复版（已解决 Reward 下降/过拟合问题）
+# train_distill.py ← 2025 终极稳定版（已修复 Reward 锁定问题）
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -20,7 +20,7 @@ DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--dataset', type=str, default='australia-covid')
-parser.add_argument('--window', type=int, default=20)         # ← 可变的历史长度
+parser.add_argument('--window', type=int, default=20)
 parser.add_argument('--horizon', type=int, default=1)
 parser.add_argument('--residual_window', type=int, default=4)
 parser.add_argument('--use_residual', type=bool, default=True)
@@ -34,7 +34,7 @@ print(f"使用设备: {device}")
 data_args = argparse.Namespace(
     dataset=args.dataset,
     sim_mat=f'{args.dataset}-adj',
-    window=args.window,          # ← 同步使用可变 window
+    window=args.window,
     horizon=args.horizon,
     train=0.5, val=0.2, test=0.3,
     cuda=True, batch=128,
@@ -84,7 +84,7 @@ history_tensor = test_X[:, :args.window].to(device) # (64, window, R)
 # ================== 5. 自进化主循环 ==================
 BATCH_SIZE_GEN = 8
 NUM_CANDIDATES = 3 # 每条 prompt 生成 3 个候选
-TOP_K = 32 
+TOP_K = 32 # 维持 32，保证信号强度
 prev_best = -1e9
 
 def parse_nums(text):
@@ -98,7 +98,9 @@ def parse_nums(text):
 
 def normalize(pred, hist):
     p = np.array(pred)
-    return (p - np.mean(hist)) / (np.std(hist) + 1e-8)
+    # 历史数据的标准差可能为 0，添加 1e-8 防止除零错误。
+    std = np.std(hist)
+    return (p - np.mean(hist)) / (std + 1e-8)
 
 for gen in range(1, 6):
     print(f"\n{'='*25} 第 {gen}/5 代 {'='*25}")
@@ -108,8 +110,8 @@ for gen in range(1, 6):
     responses = []
     prompt_indices = []
     
-    # 关键修正：降低生成温度到 0.9，稳定模型输出
-    temperature = 1.2 if gen <= 3 else 0.8 
+    # 关键修正：锁定低温度 0.7，强制模型稳定输出格式
+    temperature = 0.7
     top_p = 0.95
 
     for i in range(0, len(prompts), BATCH_SIZE_GEN):
@@ -119,9 +121,13 @@ for gen in range(1, 6):
             # 关键：设置不同 seed 保证多样性
             torch.manual_seed(42 + gen * 100 + cand)
             outputs = model.generate(
-                **inputs, max_new_tokens=256, do_sample=True,
-                temperature=temperature, top_p=top_p,
-                pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+                **inputs, 
+                max_new_tokens=64, # <-- 关键修正：减少最大生成 token 数
+                do_sample=True,
+                temperature=temperature, 
+                top_p=top_p,
+                pad_token_id=tokenizer.pad_token_id, 
+                eos_token_id=tokenizer.eos_token_id,
                 use_cache=True
             )
             batch_resp = tokenizer.batch_decode(outputs, skip_special_tokens=True)
@@ -140,6 +146,7 @@ for gen in range(1, 6):
         answers.append(ans)
 
     # ---------- 3. 归一化 + Reward ----------
+    # 此时，由于 T=0.7 且 max_new_tokens=64，llm_norm 应该包含更少的 0.0，更多有效数值
     llm_norm = np.stack([normalize(parse_nums(ans), histories[p_idx]) for ans, p_idx in zip(answers, prompt_indices)])
     P_llm = torch.tensor(llm_norm, dtype=torch.float32).unsqueeze(1).to(device)
 
@@ -162,15 +169,10 @@ for gen in range(1, 6):
     hybrid = 0.6 * rewards + 0.4 * (-mse)
 
     # ---------- 4. 选 Top-K ----------
-    threshold = prev_best * 0.9 if gen > 1 else -1e9
-    valid = hybrid > threshold
+    # 由于 Gen 1/2 被锁定在低点，我们暂时跳过阈值检查，直接选择 Top-32 中最好的
+    # 只有当 gen>2 且 prev_best 成功跳回正值后，阈值检查才有意义
     
-    # 修正逻辑：如果 Gen 2/3 失败，我们仍需训练最不坏的样本以拉回模型
-    if np.any(valid):
-        top_idx = np.where(valid)[0][np.argsort(hybrid[valid])[-TOP_K:]]
-    else:
-        # 如果所有样本都低于阈值，选择 Top-K 中最高的 64 个（最不坏的）
-        top_idx = np.argsort(hybrid)[-TOP_K:]
+    top_idx = np.argsort(hybrid)[-TOP_K:]
 
     best_r = hybrid[top_idx[-1]]
     prev_best = max(prev_best, best_r)
@@ -187,7 +189,7 @@ for gen in range(1, 6):
         train_dataset=tokenized,
         args=SFTConfig(
             per_device_train_batch_size=1, gradient_accumulation_steps=4, 
-            num_train_epochs=1, # 维持 1 Epoch
+            num_train_epochs=1, 
             learning_rate=5e-5, fp16=True, output_dir=f"./gen_{gen}", save_strategy="no",
             gradient_checkpointing=True, 
             remove_unused_columns=False,
