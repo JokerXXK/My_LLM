@@ -1,20 +1,28 @@
 # train_distill.py — 自进化增强版（带变异、多样性、奖励温度）
 import os
+import argparse
+import re
+
+# 抑制并行化警告
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-os.environ["ATTN_IMPLEMENTATION"] = "eager"
+# 强制使用 eager 模式以提高兼容性
+os.environ["ATTN_IMPLEMENTATION"] = "eager" 
 
 import torch
 import torch.nn.functional as F
 import numpy as np
-import re
-import argparse
+
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from trl import SFTTrainer, SFTConfig
 from datasets import Dataset
+
+# 假设以下模块存在于你的项目中
 from data import DataBasicLoader
 from models import HybridGNN
+
+# 修复 DynamicCache 属性缺失问题
 from transformers.cache_utils import DynamicCache
 DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
 
@@ -68,7 +76,8 @@ model = AutoModelForCausalLM.from_pretrained(
     attn_implementation="eager",
     quantization_config=BitsAndBytesConfig(
         load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
+        # 修复 CUBLAS_STATUS_NOT_SUPPORTED 错误：切换到 bfloat16
+        bnb_4bit_compute_dtype=torch.bfloat16, 
         bnb_4bit_use_double_quant=True,
         bnb_4bit_quant_type="nf4"
     ),
@@ -136,7 +145,7 @@ reward_model.load_state_dict(torch.load(args.rm_path, map_location=device))
 reward_model.eval()
 print("Reward Model 加载成功")
 
-# ================== 5. 生成提示（动态 window） ==================
+# ================== 5. 生成提示（动态 window） + 辅助函数 ==================
 def create_prompt(history_window):
     lines = [f"Day {t+1}: {' '.join([f'{x:.6f}' for x in day])}"
              for t, day in enumerate(history_window)]
@@ -146,6 +155,7 @@ def create_prompt(history_window):
 Day {args.window + 1} (predict {num_regions} regions, space separated):<|end|>
 <|assistant|>"""
 
+# 从 DataLoader 获取测试数据 (16 个样本)
 test_X = data_loader.test[0][:16]
 histories = test_X[:, :args.window].cpu().numpy()
 prompts = [create_prompt(hist) for hist in histories]
@@ -159,7 +169,7 @@ def parse_nums(text, num_regions):
     return nums[:num_regions]
 
 def mutate_prompt(prompt, strength=0.5):
-    # 简单的随机替换数值或词语示例 — 你可以根据具体 prompt 语义设计
+    # 简单的随机替换数值或词语示例
     parts = prompt.split('\n')
     new_parts = []
     for line in parts:
@@ -174,6 +184,30 @@ def mutate_prompt(prompt, strength=0.5):
             new_parts.append(line)
     return '\n'.join(new_parts)
 
+def cosine_similarity(tensor_a, tensor_b):
+    """计算余弦相似度。用于多样性惩罚。"""
+    # 确保张量是浮点型，并处理维度
+    A = tensor_a.float() 
+    B = tensor_b.float()
+    
+    # 检查并调整维度以进行广播
+    if A.dim() == 2 and B.dim() == 2:
+        # A: [N, D], B: [M, D] -> [N, M]
+        A = A.unsqueeze(1)
+        B = B.unsqueeze(0)
+    elif A.dim() == 1 and B.dim() == 2:
+        # A: [D], B: [M, D] -> [1, M]
+        A = A.unsqueeze(0).unsqueeze(1)
+        B = B.unsqueeze(0)
+    
+    # 确保维度匹配
+    if A.shape[-1] != B.shape[-1]:
+        raise ValueError("Last dimension (embedding size) must match for cosine similarity.")
+
+    # 计算相似度
+    return F.cosine_similarity(A, B, dim=-1)
+
+
 # ================== 6. 自进化主循环（增强版） ==================
 BATCH_SIZE_GEN = args.gen_batch
 MAX_NEW_TOKENS = args.max_new_tokens
@@ -185,62 +219,82 @@ for gen in range(1, 6):
     model = model.to(device)
     model.eval()
 
-    # 1. 生成候选 prompts (变异 + 多轮生成)
-candidate_prompts = []
-base_indices = []  # 每个候选对应哪个原始 prompt
-for base_idx, p in enumerate(prompts):
-    # 原始 prompt
-    candidate_prompts.append(p)
-    base_indices.append(base_idx)
-    # 变异 prompt
-    if np.random.rand() < args.mutation_rate:
-        mutated = mutate_prompt(p, strength=args.mutation_strength)
-        candidate_prompts.append(mutated)
-        base_indices.append(base_idx)
+    # 1. 生成候选 prompts (变异 + 记录原始索引)
+    # 格式: (prompt_text, original_test_X_index)
+    indexed_candidate_prompts = [] 
+    
+    for original_idx, p in enumerate(prompts): 
+        # 1.1 保留原 prompt
+        indexed_candidate_prompts.append((p, original_idx))
+        
+        # 1.2 根据 mutation_rate 生成变异版本
+        if np.random.rand() < args.mutation_rate:
+            indexed_candidate_prompts.append((mutate_prompt(p, strength=args.mutation_strength), original_idx))
 
-# 2. 对每个候选 prompt 生成预测
-answers = []
-prompt_indices = []  # 对应 base_indices
-for i in range(0, len(candidate_prompts), BATCH_SIZE_GEN):
-    batch_prompts = candidate_prompts[i:i + BATCH_SIZE_GEN]
-    batch_base = base_indices[i:i + BATCH_SIZE_GEN]
-    inputs = tokenizer(
-        batch_prompts,
-        return_tensors="pt",
-        padding=True,
-        truncation=True,
-        max_length=256
-    ).to(device)
-    input_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).tolist()
+    # 2. 对每个候选 prompt 生成预测
+    answers = []
+    # 修复 IndexError 关键：存储答案对应的原始 test_X 索引 (0-15)
+    original_test_X_indices = [] 
+    # 存储答案对应的 candidate_prompt_texts 索引 (用于多样性惩罚)
+    candidate_prompt_indices = []
+    
+    # 获取所有用于生成的 prompt 文本 (用于 tokenization)
+    candidate_prompt_texts = [item[0] for item in indexed_candidate_prompts]
+    
+    current_prompt_idx_offset = 0
+    
+    for i in range(0, len(indexed_candidate_prompts), BATCH_SIZE_GEN):
+        batch_data = indexed_candidate_prompts[i:i + BATCH_SIZE_GEN]
+        batch_prompts = [item[0] for item in batch_data]
+        batch_original_indices = [item[1] for item in batch_data] 
 
-    for r in range(NUM_GEN_ROUNDS):
-        with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_new_tokens=MAX_NEW_TOKENS,
-                do_sample=True,
-                temperature=0.9 if r>0 else 0.7,
-                top_p=0.95,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-                use_cache=False,
-            )
-        for out_ids, in_len, base_idx in zip(outputs, input_lens, batch_base):
-            new_text = tokenizer.decode(out_ids[in_len:], skip_special_tokens=True).strip()
-            answers.append(new_text)
-            prompt_indices.append(base_idx)  # 注意这里是 base_idx
-    torch.cuda.empty_cache()
+        inputs = tokenizer(
+            batch_prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=256
+        ).to(device)
+        input_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).tolist()
+        
+        # 跟踪当前批次中每个 prompt 在 full_candidate_list 中的起始索引
+        batch_prompt_indices = list(range(current_prompt_idx_offset, current_prompt_idx_offset + len(batch_prompts)))
 
-    # ✅ 检查防止越界
-    prompt_indices = [min(idx, len(test_X)-1) for idx in prompt_indices]
+        for r in range(NUM_GEN_ROUNDS):
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=MAX_NEW_TOKENS,
+                    do_sample=True,
+                    temperature=0.9 if r>0 else 0.7,
+                    top_p=0.95,
+                    pad_token_id=tokenizer.pad_token_id,
+                    eos_token_id=tokenizer.eos_token_id,
+                    use_cache=False,
+                )
+            
+            for k in range(len(batch_prompts)):
+                out_ids = outputs[k]
+                in_len = input_lens[k]
+                original_idx = batch_original_indices[k]
+                prompt_text_idx = batch_prompt_indices[k]
+                
+                new_text = tokenizer.decode(out_ids[in_len:], skip_special_tokens=True).strip()
+                answers.append(new_text)
+                
+                original_test_X_indices.append(original_idx) 
+                candidate_prompt_indices.append(prompt_text_idx)
 
+        current_prompt_idx_offset += len(batch_prompts)
+        torch.cuda.empty_cache()
 
     # 3. 解析答案为数值 + 拼接 RM 输入 + 计算 reward
     parsed = [parse_nums(ans, num_regions) for ans in answers]
     P_llm_raw = torch.tensor(parsed, dtype=torch.float32).unsqueeze(1).to(device)
 
     # 尺度映射
-    ref_last_hist = test_X[prompt_indices, args.window-1].to(device)
+    # 修复索引越界：使用 original_test_X_indices
+    ref_last_hist = test_X[original_test_X_indices, args.window-1].to(device)
     eps = 1e-6
     scale = ref_last_hist.abs() + eps
     p_raw = P_llm_raw.squeeze(1)
@@ -253,43 +307,65 @@ for i in range(0, len(candidate_prompts), BATCH_SIZE_GEN):
     # 构造 RM 输入并评分
     rewards = []
     prompt_embeds = []
-    for idx, pidx in enumerate(prompt_indices):
-        hist = test_X[pidx, :args.window].to(device)
+    
+    for idx, original_idx in enumerate(original_test_X_indices):
+        # 使用原始 test_X 索引
+        hist = test_X[original_idx, :args.window].to(device)
         inp = torch.cat([hist.unsqueeze(0), P_llm_scaled[idx:idx+1]], dim=1)  # shape (1, window+1, num_regions)
         with torch.no_grad():
             r_val, _ = reward_model(inp)
         rewards.append(r_val.item())
-        # 用模型编码 prompt 为 embedding（示例用 LLM encoder）
+        
+        # 用模型编码 prompt 为 embedding (用于多样性惩罚)
+        current_prompt_text = candidate_prompt_texts[candidate_prompt_indices[idx]]
+
         with torch.no_grad():
-            emb = model.encode(candidate_prompts[pidx], convert_to_tensor=True)
+            # 备用方案：对 prompt 进行 tokenization 并使用 LLM 的最后一层隐藏状态作为 embedding
+            input_ids = tokenizer(current_prompt_text, return_tensors="pt").input_ids.to(device)
+            # 确保模型返回 hidden_states
+            outputs = model(input_ids, output_hidden_states=True) 
+            # 取最后一个 token 的最后一个隐藏层作为 embedding
+            emb = outputs.hidden_states[-1][0, -1, :].cpu()
+
         prompt_embeds.append(emb.cpu())
+        
     rewards = torch.tensor(rewards, dtype=torch.float32)
     prompt_embeds = torch.stack(prompt_embeds)
-
+    
     # 4. 奖励温度 + 多样性惩罚
     rewards_scaled = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
     rewards_scaled = torch.sigmoid(rewards_scaled * args.reward_temp)
     adjusted_rewards = rewards_scaled.clone()
+    
+    # 确保 prompt_embeds 是 float32 用于相似度计算
+    prompt_embeds = prompt_embeds.float() 
+
     for i in range(len(adjusted_rewards)):
-        sim = cosine_similarity(prompt_embeds[i:i+1], prompt_embeds).mean()
+        # 计算当前 prompt 与所有其他 prompt 的相似度
+        sim_matrix = cosine_similarity(prompt_embeds[i:i+1], prompt_embeds)
+        sim = sim_matrix.mean()
         adjusted_rewards[i] -= args.lambda_div * sim
 
     # 5. 选 Top-K
     K = min(TOP_K, len(adjusted_rewards))
     topk_indices = torch.topk(adjusted_rewards, k=K).indices.tolist()
-    top_prompts = [candidate_prompts[idx] for idx in topk_indices]
+    
+    # 使用正确的索引获取 top prompts 和 answers
+    top_prompts = [candidate_prompt_texts[candidate_prompt_indices[idx]] for idx in topk_indices]
+    top_answers = [answers[idx] for idx in topk_indices]
     top_rewards = adjusted_rewards[topk_indices].cpu().numpy()
 
     print("本代选出的 Top 候选（增强版）:")
     for rank, idx in enumerate(topk_indices, 1):
-        print(f"  Rank {rank}: idx={idx}, reward={top_rewards[rank-1]:.6f}")
+        prompt_text = candidate_prompt_texts[candidate_prompt_indices[idx]]
+        print(f"  Rank {rank}: reward={top_rewards[rank-1]:.6f}")
         if args.debug:
-            print("    prompt:", candidate_prompts[idx][:120].replace('\n',' '))
+            print("    prompt:", prompt_text[:120].replace('\n',' '))
 
     print(f">> rewards 分布: mean={adjusted_rewards.mean().item():.6f}, std={adjusted_rewards.std().item():.6f}, max={adjusted_rewards.max().item():.6f}")
 
     # 6. SFT 微调（用 Top-K prompts）
-    train_texts = [top_prompts[i] + "\n" + answers[topk_indices[i]] + "<|end|>" for i in range(len(top_prompts))]
+    train_texts = [top_prompts[i] + "\n" + top_answers[i] + "<|end|>" for i in range(len(top_prompts))]
     train_texts = train_texts * 2  # 简单重复扩充
 
     if len(train_texts) < 2:
@@ -312,7 +388,8 @@ for i in range(0, len(candidate_prompts), BATCH_SIZE_GEN):
             num_train_epochs=1,
             learning_rate=1e-4,
             fp16=False,
-            bf16=False,
+            # 修复 CUBLAS_STATUS_NOT_SUPPORTED 错误
+            bf16=True, 
             logging_steps=1,
             output_dir=f"./evolve_gen_{gen}",
             save_strategy="no",
@@ -367,4 +444,3 @@ except Exception as e:
         model.save_pretrained(final_path)
     except Exception as e2:
         print("再次保存失败:", e2)
-
