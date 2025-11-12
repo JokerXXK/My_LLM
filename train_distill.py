@@ -20,6 +20,7 @@ DynamicCache.seen_tokens = property(lambda self: self.get_seq_length())
 parser = argparse.ArgumentParser()
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--dataset', type=str, default='australia-covid')
+parser.add_argument('--sim_mat', type=str, default='australia-adj')
 parser.add_argument('--window', type=int, default=20)
 parser.add_argument('--horizon', type=int, default=1)
 parser.add_argument('--residual_window', type=int, default=4)
@@ -33,7 +34,7 @@ print(f"使用设备: {device}")
 # ================== 1. 加载数据 ==================
 data_args = argparse.Namespace(
     dataset=args.dataset,
-    sim_mat=f'{args.dataset}-adj',
+    sim_mat=args.sim_mat,
     window=args.window,
     horizon=args.horizon,
     train=0.5, val=0.2, test=0.3,
@@ -199,3 +200,4 @@ for gen in range(1, 6):
 model.save_pretrained("EpiEvolve_Final")
 tokenizer.save_pretrained("EpiEvolve_Final")
 print("完成！")
+
