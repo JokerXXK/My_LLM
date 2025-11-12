@@ -59,7 +59,7 @@ LLM_MODEL_ID = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 print(f"加载 {LLM_MODEL_ID} (4bit)...")
 model = AutoModelForCausalLM.from_pretrained(
     LLM_MODEL_ID,
-    device_map="auto",
+    device_map={'': device}, # 将所有层映射到指定的 device (e.g., cuda:0)
     attn_implementation="eager",
     quantization_config=BitsAndBytesConfig(
         load_in_4bit=True,
@@ -271,3 +271,4 @@ final_path = "EpiEvolve_TinyLlama_Final"
 model.save_pretrained(final_path)
 tokenizer.save_pretrained(final_path)
 print(f"\n5代自进化完成！最终模型已保存至: {final_path}")
+
