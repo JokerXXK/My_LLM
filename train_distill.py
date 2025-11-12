@@ -186,45 +186,54 @@ for gen in range(1, 6):
     model.eval()
 
     # 1. 生成候选 prompts (变异 + 多轮生成)
-    candidate_prompts = []
-    for p in prompts:
-        # 保留原 prompt
-        candidate_prompts.append(p)
-        # 根据 mutation_rate 生成变异版本
-        if np.random.rand() < args.mutation_rate:
-            candidate_prompts.append(mutate_prompt(p, strength=args.mutation_strength))
+candidate_prompts = []
+base_indices = []  # 每个候选对应哪个原始 prompt
+for base_idx, p in enumerate(prompts):
+    # 原始 prompt
+    candidate_prompts.append(p)
+    base_indices.append(base_idx)
+    # 变异 prompt
+    if np.random.rand() < args.mutation_rate:
+        mutated = mutate_prompt(p, strength=args.mutation_strength)
+        candidate_prompts.append(mutated)
+        base_indices.append(base_idx)
 
-    # 2. 对每个候选 prompt 生成预测
-    answers = []
-    prompt_indices = []
-    for i in range(0, len(candidate_prompts), BATCH_SIZE_GEN):
-        batch_prompts = candidate_prompts[i:i + BATCH_SIZE_GEN]
-        inputs = tokenizer(
-            batch_prompts,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=256
-        ).to(device)
-        input_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).tolist()
+# 2. 对每个候选 prompt 生成预测
+answers = []
+prompt_indices = []  # 对应 base_indices
+for i in range(0, len(candidate_prompts), BATCH_SIZE_GEN):
+    batch_prompts = candidate_prompts[i:i + BATCH_SIZE_GEN]
+    batch_base = base_indices[i:i + BATCH_SIZE_GEN]
+    inputs = tokenizer(
+        batch_prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=256
+    ).to(device)
+    input_lens = (inputs["input_ids"] != tokenizer.pad_token_id).sum(dim=1).tolist()
 
-        for r in range(NUM_GEN_ROUNDS):
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=MAX_NEW_TOKENS,
-                    do_sample=True,
-                    temperature=0.9 if r>0 else 0.7,
-                    top_p=0.95,
-                    pad_token_id=tokenizer.pad_token_id,
-                    eos_token_id=tokenizer.eos_token_id,
-                    use_cache=False,
-                )
-            for out_ids, in_len, pidx in zip(outputs, input_lens, range(i, i + len(batch_prompts))):
-                new_text = tokenizer.decode(out_ids[in_len:], skip_special_tokens=True).strip()
-                answers.append(new_text)
-                prompt_indices.append(pidx)
-        torch.cuda.empty_cache()
+    for r in range(NUM_GEN_ROUNDS):
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=0.9 if r>0 else 0.7,
+                top_p=0.95,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+                use_cache=False,
+            )
+        for out_ids, in_len, base_idx in zip(outputs, input_lens, batch_base):
+            new_text = tokenizer.decode(out_ids[in_len:], skip_special_tokens=True).strip()
+            answers.append(new_text)
+            prompt_indices.append(base_idx)  # 注意这里是 base_idx
+    torch.cuda.empty_cache()
+
+    # ✅ 检查防止越界
+    prompt_indices = [min(idx, len(test_X)-1) for idx in prompt_indices]
+
 
     # 3. 解析答案为数值 + 拼接 RM 输入 + 计算 reward
     parsed = [parse_nums(ans, num_regions) for ans in answers]
@@ -358,3 +367,4 @@ except Exception as e:
         model.save_pretrained(final_path)
     except Exception as e2:
         print("再次保存失败:", e2)
+
